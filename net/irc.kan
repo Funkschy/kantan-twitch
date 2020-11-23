@@ -1,0 +1,130 @@
+import ":std/str";
+
+type TokenKind enum {
+    Error, Colon, Bang, Nick, Command, MsgContent, End
+}
+
+type Token struct {
+    kind: TokenKind,
+    lexeme: str.View
+}
+
+def token(kind: TokenKind, lexeme: str.View): Token {
+    return Token {
+        kind: kind,
+        lexeme: lexeme
+    };
+}
+
+type Lexer struct {
+    content: str.View,
+    current: usize
+}
+
+def lexer(content: str.View): Lexer {
+    return Lexer {
+        content: content,
+        current: 0
+    };
+}
+
+def (l: *Lexer) at_end(): bool {
+    return l.current >= l.content.len
+        || l.content.drop(l.current).starts_with(str.view_from("\r"));
+}
+
+def (l: *Lexer) take(kind: TokenKind, len: usize): Token {
+    let rest = l.content.drop(l.current);
+    l.current += len;
+    return token(kind, str.view(rest.data, len));
+}
+
+def (l: *Lexer) current_char(): i8 {
+    return *l.content.drop(l.current).data;
+}
+
+def is_letter(c: i8): bool {
+    return c >= 'a' && c <= 'z'
+        || c >= 'A' && c <= 'Z';
+}
+
+def is_number(c: i8): bool {
+    return c >= '0' && c <= '9';
+}
+
+def is_special(c: i8): bool {
+    return c == '-'
+        || c == '['
+        || c == ']'
+        || c ==  '\\'
+        || c ==  '`'
+        || c ==  '^'
+        || c ==  '{'
+        || c ==  '}';
+}
+
+def is_nick_char(c: i8): bool {
+    return is_letter(c) || is_number(c) || is_special(c);
+}
+
+def (l: *Lexer) nickname(): Token {
+    let start = l.current;
+    while !l.at_end() && is_nick_char(l.current_char()) {
+        l.current += 1;
+    }
+
+    let len = l.current - start;
+    return token(TokenKind.Nick, l.content.drop(start).take(len));
+}
+
+def (l: *Lexer) command(): Token {
+    let start = l.current;
+    while !l.at_end() && is_letter(l.current_char()) || is_number(l.current_char()) {
+        l.current += 1;
+    }
+
+    let len = l.current - start;
+    return token(TokenKind.Command, l.content.drop(start).take(len));
+}
+
+def (l: *Lexer) msg_body(): Token {
+    let start = l.current;
+    l.skip_after('\r');
+    return token(
+        TokenKind.MsgContent,
+        l.content.drop(start).take(l.current - start - 1)
+    );
+}
+
+def (l: *Lexer) consume(kind: TokenKind): Token {
+    let tok = l.next();
+    if tok.kind != kind {
+        return token(TokenKind.Error, str.view_from("consume error"));
+    }
+    return tok;
+}
+
+def (l: *Lexer) skip_after(c: i8) {
+    while !l.at_end() && l.current_char() != c {
+        l.current += 1;
+    }
+    l.current += 1;
+}
+
+def (l: *Lexer) next(): Token {
+    let rest = l.content.drop(l.current);
+
+    if rest.starts_with(str.view_from(":")) {
+        return l.take(TokenKind.Colon, 1);
+    }
+
+    if rest.starts_with(str.view_from("!")) {
+        return l.take(TokenKind.Bang, 1);
+    }
+
+    if is_letter(l.current_char()) {
+        return l.nickname();
+    }
+
+    return token(TokenKind.Error, rest);
+}

@@ -1,0 +1,243 @@
+import "io";
+
+import ":std/str";
+import ":std/dbg";
+import ":std/libc";
+
+import "http";
+import "socket";
+import "tcp_socket" as tcp;
+
+extern def rand(): i32;
+
+type Protocol enum {
+    WS, WSS
+}
+
+type Connection struct {
+    data: ConnectionData
+}
+
+def (c: *Connection) inner(): *socket.Connection {
+    return &c.data as *socket.Connection;
+}
+
+type ConnectionData union {
+    tcp: tcp.TcpConnection,
+    ssl: tcp.OpenSSLConnection
+}
+
+def (c: *Connection) close() {
+    let res = c.inner().disconnect();
+    if res.is_error {
+        io.printf("ERROR: %s\n", res.content.cstring());
+    }
+    res.free();
+
+    c.inner().free();
+}
+
+type ConnectionResult struct {
+    is_error: bool,
+    data: ConnectionResultData
+}
+
+type ConnectionResultData union {
+    connection: Connection,
+    error: str.String
+}
+
+def connect(protocol: Protocol, host: str.View): ConnectionResult {
+    let client = http.client();
+    let conn: Connection = undefined;
+    let port: u16 = 80;
+
+    if protocol == Protocol.WS {
+        conn.data.tcp = tcp.connection();
+    } else {
+        conn.data.ssl = tcp.ssl_connection();
+        port = 443;
+    }
+
+    let path = str.from("/?encoding=text");
+    defer path.free();
+
+    let request = http.request(http.Method.GET, host, path.view());
+    request.add_param(str.view_from("Sec-WebSocket-Version"), str.view_from("13"));
+    request.add_param(str.view_from("Sec-WebSocket-Key"), str.view_from("dGhlIHNhbXBsZSBub25jZQ=="));
+    request.add_param(str.view_from("Connection"), str.view_from("Upgrade"));
+    request.add_param(str.view_from("Upgrade"), str.view_from("websocket"));
+    defer request.free();
+
+    let res = client.execute(conn.inner(), port, &request);
+    defer res.free();
+
+    if res.is_error {
+        conn.close();
+        return ConnectionResult {
+            is_error: true,
+            data: ConnectionResultData { error: res.content }
+        };
+    }
+
+    let res = conn.inner().read(str.view_from("\r\n\r\n"));
+    if res.is_error {
+        dbg.assert(false, res.content.cstring());
+    }
+
+    return ConnectionResult {
+        is_error: false,
+        data: ConnectionResultData {
+            connection: conn
+        }
+    };
+}
+
+def to_big_endian16(value: i16): i16 {
+    let ret = value;
+    let ptr = &ret as *i8;
+    *(ptr + 0) = ((value & (255 << 8)) >> 8) as i8;
+    *(ptr + 1) = ((value & (255 << 0)) >> 0) as i8;
+    return ret;
+}
+
+def to_big_endian32(value: i32): i32 {
+    let ret = value;
+    let ptr = &ret as *i8;
+    *(ptr + 0) = ((value & (255 << 24)) >> 24) as i8;
+    *(ptr + 1) = ((value & (255 << 16)) >> 16) as i8;
+    *(ptr + 2) = ((value & (255 << 8)) >> 8) as i8;
+    *(ptr + 3) = ((value & (255 << 0)) >> 0) as i8;
+    return ret;
+}
+
+def to_big_endian64(value: i64): i64 {
+    let ret = value;
+    let ptr = &ret as *i8;
+    *(ptr + 0) = ((value & (255 << 56)) >> 56) as i8;
+    *(ptr + 1) = ((value & (255 << 48)) >> 48) as i8;
+    *(ptr + 2) = ((value & (255 << 40)) >> 40) as i8;
+    *(ptr + 3) = ((value & (255 << 32)) >> 32) as i8;
+    *(ptr + 4) = ((value & (255 << 24)) >> 24) as i8;
+    *(ptr + 5) = ((value & (255 << 16)) >> 16) as i8;
+    *(ptr + 6) = ((value & (255 << 8)) >> 8) as i8;
+    *(ptr + 7) = ((value & (255 << 0)) >> 0) as i8;
+    return ret;
+}
+
+def (c: *Connection) send_raw(op_code: OpCode, fin: bool, payload: str.View) {
+    let header = header(fin)
+        .with_opcode(op_code)
+        .with_mask(true);
+
+    let header_size = sizeof FrameHeader;
+
+    if payload.len < 126 {
+        header = header.with_len(payload.len as u8);
+    } else if payload.len < 65535 {
+        header = header.with_len(126);
+        header_size += 2;
+    } else {
+        header = header.with_len(127);
+        header_size += 8;
+    }
+
+    let buf_len = header_size + sizeof u32 + payload.len;
+    let buffer = libc.malloc(buf_len) as *i8;
+    defer delete buffer;
+
+    let curr_ptr = buffer;
+    libc.memcpy(curr_ptr as *void, &header as *void, sizeof FrameHeader);
+    curr_ptr += sizeof FrameHeader;
+
+    if header.len() == 126 {
+        *(curr_ptr as *u16) = to_big_endian16(payload.len as i16) as u16;
+        curr_ptr += 2;
+    } else if header.len() == 127 {
+        *(curr_ptr as *u64) = to_big_endian64(payload.len as i64) as u64;
+        curr_ptr += 8;
+    }
+
+    let mask_value = rand();
+    let key = curr_ptr;
+
+    *(curr_ptr as *i32) = to_big_endian32(mask_value);
+    curr_ptr += sizeof u32;
+
+    let n = payload.len;
+    let bytes = payload.data;
+    for let i: usize = 0; i < n; i += 1 {
+        *(curr_ptr + i) = *(bytes + i) ^ *(key + i & 3);
+    }
+
+    let res = c.inner().write(str.view(buffer, buf_len));
+    if res.is_error {
+        io.printf("ERROR: %s\n", res.content.cstring());
+        res.free();
+    }
+}
+
+def (c: *Connection) read_message(): str.String {
+    let reply = c.inner().read(str.view_from("\r\n"));
+    if reply.is_error {
+        reply.free();
+        return str.from("error while reading");
+    }
+    let reply = reply.content;
+    defer reply.free();
+
+    let reply_header = *(reply.cstring() as *FrameHeader);
+    let offset = sizeof FrameHeader;
+    // skip extended length
+    if reply_header.len() == 126 {
+        offset += 2;
+    } else if reply_header.len() == 127 {
+        offset += 8;
+    }
+
+    let view = reply.view();
+    return view.drop(offset).clone();
+}
+
+type OpCode enum {
+    Continuation = 0,
+    Text,
+    Binary,
+    Reserved1, Reserved2, Reserved3, Reserved4, Reserved5,
+    CloseConnection,
+    Ping,
+    Pong
+}
+
+// https://tools.ietf.org/html/rfc6455#section-5.2
+type FrameHeader struct {
+    flags_and_opcode: u8,
+    mask_and_payload_len: u8
+}
+
+def header(fin: bool): FrameHeader {
+    return FrameHeader {
+        flags_and_opcode: (fin as u8) << 7,
+        mask_and_payload_len: 0
+    };
+}
+
+def (f: FrameHeader) with_opcode(code: OpCode): FrameHeader {
+    let code = *(&code as *u8);
+    f.flags_and_opcode |= code;
+    return f;
+}
+
+def (f: FrameHeader) with_mask(masked: bool): FrameHeader {
+    f.mask_and_payload_len |= (masked as u8) << 7;
+    return f;
+}
+
+def (f: FrameHeader) with_len(len: u8): FrameHeader {
+    f.mask_and_payload_len |= (len & 127);
+    return f;
+}
+
+def (f: FrameHeader) len(): u8 {
+    return f.mask_and_payload_len & 127;
+}

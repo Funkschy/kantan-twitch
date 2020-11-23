@@ -1,0 +1,58 @@
+import ":std/str";
+
+type Result struct {
+    is_error: bool,
+    content: str.String
+}
+
+def ok(): Result {
+    return Result { is_error: false, content: str.from("") };
+}
+
+def ok_msg(msg: str.String): Result {
+    return Result { is_error: false, content: msg };
+}
+
+def error(msg: str.String): Result {
+    return Result { is_error: true, content: msg };
+}
+
+def (r: *Result) free() {
+    r.content.free();
+}
+
+delegate def Connect(c: *Connection, ip: str.View, port: u16): Result;
+delegate def Disconnect(c: *Connection): Result;
+
+delegate def Read(c: *Connection, delim: str.View): Result;
+delegate def Write(c: *Connection, msg: str.View): Result;
+
+delegate def Free(c: *Connection);
+
+type Connection struct {
+    _connect_fn: Connect,
+    _disconnect_fn: Disconnect,
+    _read_fn: Read,
+    _write_fn: Write,
+    _free_fn: Free
+}
+
+def (c: *Connection) connect(ip: str.View, port: u16): Result {
+    return c._connect_fn(c, ip, port);
+}
+
+def (c: *Connection) disconnect(): Result {
+    return c._disconnect_fn(c);
+}
+
+def (c: *Connection) read(delim: str.View): Result {
+    return c._read_fn(c, delim);
+}
+
+def (c: *Connection) write(msg: str.View): Result {
+    return c._write_fn(c, msg);
+}
+
+def (c: *Connection) free() {
+    c._free_fn(c);
+}

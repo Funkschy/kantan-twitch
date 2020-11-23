@@ -1,0 +1,94 @@
+import ":std/str";
+
+import "socket";
+import "tcp_socket" as tcp;
+
+type Protocol enum {
+    HTTP, HTTPS
+}
+
+type Method enum {
+    GET
+}
+
+type Request struct {
+    method: Method,
+    host: str.View,
+    path: str.View,
+    params: str.String
+}
+
+def request(method: Method, host: str.View, path: str.View): Request {
+    return Request { method: method, host: host, path: path, params: str.from("") };
+}
+
+def (r: *Request) free() {
+    r.params.free();
+}
+
+def (r: *Request) add_param(name: str.View, value: str.View) {
+    r.params.push(str.view_from("\r\n"));
+    r.params.push(name);
+    r.params.push(str.view_from(": "));
+    r.params.push(value);
+}
+
+def (r: *Request) to_string(): str.String {
+    let s = str.from("GET ");
+    defer s.push(str.view_from("\r\n\r\n"));
+
+    s.push(r.path);
+    s.push(str.view_from(" HTTP/1.1\r\nHost: "));
+    s.push(r.host);
+    s.push(r.params.view());
+
+    return s;
+}
+
+type Client struct {
+}
+
+def client(): Client {
+    return Client {};
+}
+
+def (c: *Client) get(protocol: Protocol, host: str.View, path: str.View): socket.Result {
+    let conn: *socket.Connection = null;
+    let port: u16 = 80;
+
+    if protocol == Protocol.HTTP {
+        let tcp_conn = tcp.connection();
+        conn = &tcp_conn.socket;
+    } else {
+        let ssl_conn = tcp.ssl_connection();
+        conn = &ssl_conn.socket;
+        port = 443;
+    }
+    defer conn.free();
+    defer conn.disconnect();
+
+    let r = request(Method.GET, host, path);
+    defer r.free();
+
+    let res = c.execute(conn, port, &r);
+    if res.is_error {
+        return res;
+    }
+
+    return conn.read(str.view_from("\r\n\r\n"));
+}
+
+def (c: *Client) execute(conn: *socket.Connection, port: u16, r: *Request): socket.Result {
+    let ip = tcp.ip_from_host(r.host);
+    defer ip.free();
+
+    let res = conn.connect(ip.view(), port);
+    if res.is_error {
+        return res;
+    }
+
+    let content = r.to_string();
+    defer content.free();
+
+    return conn.write(content.view());
+}

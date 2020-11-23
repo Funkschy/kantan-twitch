@@ -1,0 +1,360 @@
+import "io";
+
+import ":std/str";
+import ":std/libc";
+
+import "socket" as s;
+
+type Ip4SocketAddress struct {
+    family: i16,
+    port: i16,
+    addr: [4]i8,
+    data: [8]i8
+}
+
+type Domain enum {
+    UNSPEC = 0,
+    UNIX,
+    INET,
+    AX25,
+    IPX,
+    APPLETALK,
+    NETROM,
+    BRIDGE,	// Multiprotocol bridge
+    AAL5,
+    X25,
+    INET6
+}
+
+type SocketType enum {
+    Stream = 1,
+    Dgram,
+    Raw,
+    Rdm,
+    Seqpacket
+}
+
+type Shutdown enum {
+    Rd, Wr, RdWr
+}
+
+type Hostent struct {
+    name: string,
+    aliases: *string,
+    addr_type: i32,
+    len: i32,
+    addr_list: **i8
+}
+
+def ip_from_host(hostname: str.View): str.String {
+    // needs to be null terminated
+    let host = hostname.clone();
+    defer host.free();
+
+    let host = gethostbyname(host.cstring());
+    if host == null {
+        return str.from("");
+    }
+
+    let addr_list = host.addr_list as **i32;
+    if addr_list == null || *addr_list == null {
+        return str.from("");
+    }
+
+    return str.from(inet_ntoa(**addr_list));
+}
+
+extern def gethostbyname(name: string): *Hostent;
+extern def inet_ntoa(addr: i32): string;
+
+extern def htons(hostshort: i16): i16;
+extern def inet_pton(family: i32, addr: *i8, dest: *void): i32;
+extern def socket(domain: i32, ty: i32, protocol: i32): i32;
+extern def connect(socketfd: i32, addr: *void, addr_len: i32): i32;
+extern def shutdown(socketfd: i32, how: i32): i32;
+extern def close(fd: i32): i32;
+
+extern def recv(socketfd: i32, buf: *void, len: usize, flags: i32): isize;
+extern def send(socketfd: i32, buf: *void, len: usize, flags: i32): isize;
+
+type TcpConnection struct {
+    socket: s.Connection,
+    fd: i32
+}
+
+def connection(): TcpConnection {
+    return TcpConnection {
+        socket: s.Connection {
+            _connect_fn: &tcp_connect,
+            _disconnect_fn: &tcp_disconnect,
+            _read_fn: &tcp_read,
+            _write_fn: &tcp_write,
+            _free_fn: &tcp_free
+        },
+        fd: -1
+    };
+}
+
+def tcp_free(c: *s.Connection) {}
+
+def tcp_connect_socket(ip: str.View, port: u16, fd: *i32): s.Result {
+    let server_addr: Ip4SocketAddress = undefined;
+
+    let inet  = Domain.INET as i32;
+    server_addr.family = inet as i16;
+    server_addr.port = htons(port);
+
+    // needs to be null terminated
+    let ip = ip.clone();
+    defer ip.free();
+
+    if inet_pton(inet, ip.cstring(), &server_addr.addr as *void) != 1 {
+        return s.error(str.from("failed to convert address to binary"));
+    }
+
+    *fd = socket(inet, SocketType.Stream as i32, 0);
+
+    if connect(*fd, &server_addr as *void, sizeof Ip4SocketAddress as i32) < 0 {
+        return s.error(str.from("failed to connect"));
+    }
+
+    return s.ok();
+}
+
+def tcp_connect(con: *s.Connection, ip: str.View, port: u16): s.Result {
+    let tcp_conn = con as *TcpConnection;
+    if tcp_conn.fd >= 0 {
+        return s.error(str.from("Trying to reopen a connection"));
+    }
+
+    let fd = -1;
+    let res = tcp_connect_socket(ip, port, &fd);
+    if res.is_error {
+        return res;
+    }
+
+    if fd < 0 {
+        return s.error(str.from("failed to create socket"));
+    }
+
+    tcp_conn.fd = fd;
+    return s.ok();
+}
+
+def tcp_disconnect(con: *s.Connection): s.Result {
+    let tcp_conn = con as *TcpConnection;
+    if shutdown(tcp_conn.fd, Shutdown.RdWr as i32) < 0 {
+        return s.error(str.from("could not shutdown connection"));
+    }
+
+    if close(tcp_conn.fd) < 0 {
+        return s.error(str.from("could not close connection"));
+    }
+
+    tcp_conn.fd = -1;
+    return s.ok();
+}
+
+def tcp_read(con: *s.Connection, delim: str.View): s.Result {
+    let tcp_conn = con as *TcpConnection;
+
+    let size: usize = 1024;
+    let reply = libc.malloc(size);
+
+    let total: usize = 0;
+    while total < size {
+        let read = recv(tcp_conn.fd, reply + total, size - total, 0);
+        if read < 0 {
+            libc.free(reply);
+            return s.error(str.from("could not read"));
+        }
+
+        if read == 0 {
+            break;
+        }
+
+        total += read as usize;
+
+        let view = str.view(reply as *i8, total);
+        if view.ends_with(delim) {
+            break;
+        }
+
+        if total >= size {
+            size *= 2;
+            reply = libc.realloc(reply, size);
+        }
+    }
+
+    *(reply as *i8 + total) = '\0';
+    return s.ok_msg(str.move_l(reply as *i8, total));
+}
+
+def tcp_write(con: *s.Connection, content: str.View): s.Result {
+    let tcp_conn = con as *TcpConnection;
+
+    let total_sent: isize = 0;
+    while total_sent as usize < content.len {
+        let sent = send(tcp_conn.fd, content.data as *void, content.len, 0);
+        if sent < 0 {
+            return s.error(str.from("could not send message"));
+        }
+
+        total_sent += sent;
+    }
+
+    return s.ok();
+}
+
+// SSL implementation using OpenSSL
+
+type SSLContext struct {}
+type SSL struct {}
+
+extern def OPENSSL_init_ssl(opts: i64, settings: *void): i32;
+extern def SSL_CTX_new (method: *void): *SSLContext;
+extern def SSL_CTX_free(ctx: *SSLContext);
+
+extern def SSL_new(ctx: *SSLContext): *SSL;
+extern def SSL_free(ssl: *SSL);
+extern def TLS_client_method(): *void;
+
+extern def SSL_set_fd(ssl: *SSL, fd: i32): i32;
+extern def SSL_connect(ssl: *SSL): i32;
+extern def SSL_shutdown(ssl: *SSL): i32;
+extern def SSL_read(ssl: *SSL, buf: *void, len: i32): i32;
+extern def SSL_write(ssl: *SSL, buf: *void, len: i32): i32;
+
+extern def ERR_get_error(): i64;
+extern def ERR_error_string(e: i64, buf: string): string;
+
+def log_ssl_errors() {
+    for let err = ERR_get_error(); err != 0 ; err = ERR_get_error() {
+        let str = ERR_error_string(err, null);
+        io.printf("ERROR: %s\n", str);
+    }
+}
+
+// for globals, undefined means 0 <=> false
+let lib_was_inited: bool = undefined;
+def ssl_library_init(): i32 {
+    if lib_was_inited {
+        return 0;
+    }
+
+    lib_was_inited = true;
+    // load error strings
+    return OPENSSL_init_ssl(2097154, null);
+}
+
+type OpenSSLConnection struct {
+    socket: s.Connection,
+    tcp_conn: TcpConnection,
+    ssl_ctx: *SSLContext,
+    ssl: *SSL
+}
+
+def ssl_connection(): OpenSSLConnection {
+    ssl_library_init();
+    return OpenSSLConnection {
+        socket: s.Connection {
+            _connect_fn: &ssl_connect,
+            _disconnect_fn: &ssl_disconnect,
+            _read_fn: &ssl_read,
+            _write_fn: &ssl_write,
+            _free_fn: &OpenSSLConnection.free as s.Free
+        },
+        tcp_conn: connection(),
+        ssl_ctx: null,
+        ssl: null
+    };
+}
+
+def (ssl_conn: *OpenSSLConnection) free() {
+    if ssl_conn.ssl_ctx != null {
+        SSL_CTX_free(ssl_conn.ssl_ctx);
+    }
+
+    if ssl_conn.ssl != null {
+        SSL_shutdown(ssl_conn.ssl);
+        SSL_free(ssl_conn.ssl);
+    }
+}
+
+def ssl_connect(con: *s.Connection, ip: str.View, port: u16): s.Result {
+    let ssl_conn = con as *OpenSSLConnection;
+
+    if ssl_conn.ssl_ctx != null || ssl_conn.ssl != null {
+        return s.error(str.from("Trying to reopen a connection"));
+    }
+
+    ssl_conn.ssl_ctx = SSL_CTX_new(TLS_client_method());
+    ssl_conn.ssl = SSL_new(ssl_conn.ssl_ctx);
+
+    let res = (&ssl_conn.tcp_conn as *s.Connection).connect(ip, port);
+    if res.is_error {
+        return res;
+    }
+
+    SSL_set_fd(ssl_conn.ssl, ssl_conn.tcp_conn.fd);
+    if SSL_connect(ssl_conn.ssl) <= 0 {
+        log_ssl_errors();
+        return s.error(str.from("could not connect via ssl"));
+    }
+
+    return s.ok();
+}
+
+def ssl_disconnect(con: *s.Connection): s.Result {
+    let ssl_conn = con as *OpenSSLConnection;
+    return (&ssl_conn.tcp_conn as *s.Connection).disconnect();
+}
+
+def ssl_read(con: *s.Connection, delim: str.View): s.Result {
+    let ssl_conn = con as *OpenSSLConnection;
+
+    let size: usize = 1024;
+    let reply = libc.malloc(size);
+
+    let total: usize = 0;
+    while total < size {
+        let read = SSL_read(ssl_conn.ssl, reply + total, (size - total) as i32);
+        if read <= 0 {
+            log_ssl_errors();
+            libc.free(reply);
+            return s.error(str.from("could not read"));
+        }
+
+        total += read as usize;
+
+        let view = str.view(reply as *i8, total);
+        if view.ends_with(delim) {
+            break;
+        }
+
+        if total >= size {
+            size *= 2;
+            reply = libc.realloc(reply, size);
+        }
+    }
+
+    *(reply as *i8 + total) = '\0';
+    return s.ok_msg(str.move_l(reply as *i8, total));
+}
+
+def ssl_write(con: *s.Connection, content: str.View): s.Result {
+    let ssl_conn = con as *OpenSSLConnection;
+
+    let total_sent: i32 = 0;
+    while total_sent as usize < content.len {
+        let data = content.data as *void + total_sent;
+        let sent = SSL_write(ssl_conn.ssl, data, content.len as i32 - total_sent);
+        if sent < 0 {
+            return s.error(str.from("could not send message"));
+        }
+
+        total_sent += sent;
+    }
+
+    return s.ok();
+}

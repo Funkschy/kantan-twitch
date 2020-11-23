@@ -1,0 +1,96 @@
+import "io";
+
+import "net/irc";
+import "net/websocket" as ws;
+
+import ":std/str";
+import ":std/files/path";
+
+let oauth_token: str.String = undefined;
+
+def main() {
+    let result = path.create("token.txt").read_to_string(&oauth_token);
+
+    if result != path.Result.OK {
+        io.printf("could not read token\n");
+        return;
+    }
+
+    connect();
+    oauth_token.free();
+}
+
+def connect() {
+    let res = ws.connect(ws.Protocol.WS, str.view_from("irc-ws.chat.twitch.tv"));
+    if res.is_error {
+        io.printf("%s\n", res.data.error.cstring());
+        return;
+    }
+
+    let connection = res.data.connection;
+    defer connection.close();
+
+    let payload = str.from("PASS oauth:");
+    payload.push(oauth_token.view());
+    defer payload.free();
+    connection.send_raw(ws.OpCode.Text, true, payload.view());
+
+    let payload = str.from("NICK Tsunbot");
+    defer payload.free();
+    connection.send_raw(ws.OpCode.Text, true, payload.view());
+
+    let payload = str.from("JOIN #funkschy");
+    defer payload.free();
+    connection.send_raw(ws.OpCode.Text, true, payload.view());
+    connection.read_message().free();
+    connection.read_message().free();
+
+    while true {
+        let msg = connection.read_message();
+        defer msg.free();
+
+        // check if this is a message and not a command
+        if !msg.view().contains(str.view_from("!")) {
+            continue;
+        }
+
+        let l = irc.lexer(msg.view());
+        if l.consume(irc.TokenKind.Colon).kind == irc.TokenKind.Error {
+            continue;
+        }
+
+        let nick = l.consume(irc.TokenKind.Nick);
+        if nick.kind == irc.TokenKind.Error {
+            continue;
+        }
+
+        l.skip_after(' ');
+        let cmd = l.command();
+        if !cmd.lexeme.eq(str.view_from("PRIVMSG")) {
+            continue;
+        }
+
+        l.skip_after(':');
+
+        let content = l.msg_body().lexeme;
+        if !content.starts_with(str.view_from("$")) {
+            continue;
+        }
+
+        io.printf(
+            "%.*s: %.*s\n",
+            nick.lexeme.len,
+            nick.lexeme.data,
+            content.len,
+            content.data
+        );
+
+        if !nick.lexeme.eq(str.view_from("funkschy")) {
+            continue;
+        }
+
+        if content.starts_with(str.view_from("$quit")) {
+            break;
+        }
+    }
+}
